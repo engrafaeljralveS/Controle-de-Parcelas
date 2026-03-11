@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Controle de Fatura - Cartão de Crédito</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, collection, onSnapshot, addDoc, deleteDoc, doc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        // Configurações do Firebase injetadas pelo ambiente
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'controle-fatura-app';
+        const apiKey = ""; // Chave da API Gemini (vazia conforme instruções)
+
+        let user = null;
+
+        // Autenticação inicial obrigatória
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Erro na autenticação:", error);
+            }
+        };
+
+        initAuth();
+
+        onAuthStateChanged(auth, (u) => {
+            user = u;
+            if (user) {
+                setupRealtimeUpdates();
+            }
+        });
+
+        window.expenses = [];
+        let chartInstance = null;
+        let currentFilter = 'all';
+        let sortConfig = { key: 'date', direction: 'asc' };
+
+        const monthNames = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
+        const formatBRL = (v) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+        const formatDate = (dateStr) => {
+            if(!dateStr) return '';
+            const [y, m, d] = dateStr.split('-');
+            return `${d}/${m}/${y}`;
+        };
+
+        const formatMonthYear = (yyyymm) => {
+            const [y, m] = yyyymm.split('-');
+            return `${monthNames[parseInt(m)-1]}/${y}`;
+        };
+
+        /**
+         * REGRA DE FECHAMENTO (DIA 13):
+         * Se o dia da compra for >= 13, a primeira parcela vai para o mês seguinte.
+         */
+        const getMonthKey = (startDateStr, monthsToAdd) => {
+            const [y, m, d] = startDateStr.split('-');
+            const day = parseInt(d);
+            let date = new Date(parseInt(y), parseInt(m) - 1, 1);
+            
+            const extraOffset = day >= 13 ? 1 : 0;
+            
+            date.setMonth(date.getMonth() + monthsToAdd + extraOffset);
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+        };
+
+        const getMonthDiff = (startDateStr, targetYyyyMm) => {
+            const [y1, m1, d1] = startDateStr.split('-');
+            const [y2, m2] = targetYyyyMm.split('-');
+            const day = parseInt(d1);
+            
+            const startYear = parseInt(y1);
+            const startMonth = parseInt(m1);
+            const targetYear = parseInt(y2);
+            const targetMonth = parseInt(m2);
+
+            const baseDiff = (targetYear - startYear) * 12 + (targetMonth - startMonth);
+            return day >= 13 ? baseDiff - 1 : baseDiff;
+        };
+
+        // --- ANALISE IA ---
+        window.analyzeWithAI = async () => {
+            if (window.expenses.length === 0) {
+                showToast("Adicione compras antes de analisar!", "error");
+                return;
+            }
+
+            const analysisBtn = document.getElementById('aiAnalysisBtn');
+            const originalContent = analysisBtn.innerHTML;
+            analysisBtn.disabled = true;
+            analysisBtn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Analisando...`;
+            lucide.createIcons();
+
+            const prompt = `Analise os seguintes gastos de cartão de crédito e forneça um resumo financeiro curto (máximo 4 tópicos). 
+            Identifique categorias de gastos elevados e dê uma dica prática de economia.
+            Dados: ${JSON.stringify(window.expenses.map(e => ({nome: e.name, valor: e.installmentValue, parcelas: e.installmentsCount})))}`;
+
+            try {
+                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: prompt }] }]
+                    })
+                });
+                
+                const result = await response.json();
+                const aiText = result.candidates?.[0]?.content?.parts?.[0]?.text || "Não foi possível gerar a análise no momento.";
+                
+                document.getElementById('aiResultText').innerText = aiText;
+                document.getElementById('aiModal').classList.remove('hidden');
+                
+            } catch (error) {
+                console.error("Erro na AI:", error);
+                showToast("Erro ao conectar com a IA.", "error");
+            } finally {
+                analysisBtn.disabled = false;
+                analysisBtn.innerHTML = originalContent;
+                lucide.createIcons();
+            }
+        };
+
+        function setupRealtimeUpdates() {
+            const q = collection(db, 'artifacts', appId, 'public', 'data', 'compras');
+            onSnapshot(q, (snapshot) => {
+                window.expenses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                updateApp();
+            }, (error) => {
+                console.error("Erro ao ler dados:", error);
+            });
+        }
+
+        window.updateApp = () => {
+            const timelineData = calculateTimeline();
+            updateChart(timelineData);
+            updateFilterDropdown(timelineData);
+            renderList();
+        }
+
+        function calculateTimeline() {
+            const monthlyTotals = {};
+            let grandTotal = 0;
+            let pendingTotal = 0;
+
+            const now = new Date();
+            const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+            window.expenses.forEach(exp => {
+                const totalCompValue = (exp.installmentValue * exp.installmentsCount);
+                grandTotal += totalCompValue;
+
+                for (let i = 0; i < exp.installmentsCount; i++) {
+                    const monthKey = getMonthKey(exp.date, i);
+                    if (!monthlyTotals[monthKey]) monthlyTotals[monthKey] = 0;
+                    monthlyTotals[monthKey] += exp.installmentValue;
+
+                    // Cálculo do Saldo Pendente (Contando do mês atual em diante)
+                    if (monthKey >= currentMonthKey) {
+                        pendingTotal += exp.installmentValue;
+                    }
+                }
+            });
+
+            document.getElementById('totalGlobal').innerText = `Dívida Histórica: ${formatBRL(grandTotal)}`;
+            document.getElementById('totalPendente').innerText = `Saldo Devedor: ${formatBRL(pendingTotal)}`;
+            
+            return monthlyTotals;
+        }
+
+        function updateChart(monthlyTotals) {
+            const ctx = document.getElementById('timelineChart').getContext('2d');
+            const sortedMonthKeys = Object.keys(monthlyTotals).sort();
+            const labels = sortedMonthKeys.map(key => formatMonthYear(key));
+            const dataValues = sortedMonthKeys.map(key => monthlyTotals[key]);
+
+            if (chartInstance) chartInstance.destroy();
+
+            chartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Total Mensal',
+                        data: dataValues,
+                        backgroundColor: '#4f46e5',
+                        borderRadius: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: { beginAtZero: true, ticks: { callback: v => 'R$ ' + v } }
+                    }
+                }
+            });
+        }
+
+        function updateFilterDropdown(monthlyTotals) {
+            const filterSelect = document.getElementById('monthFilter');
+            const sortedMonthKeys = Object.keys(monthlyTotals).sort();
+            const prev = filterSelect.value;
+            filterSelect.innerHTML = '<option value="all">Todos os meses</option>';
+            sortedMonthKeys.forEach(key => {
+                const opt = document.createElement('option');
+                opt.value = key;
+                opt.textContent = formatMonthYear(key);
+                filterSelect.appendChild(opt);
+            });
+            filterSelect.value = sortedMonthKeys.includes(prev) ? prev : 'all';
+        }
+
+        window.setSort = (key) => {
+            if (sortConfig.key === key) {
+                sortConfig.direction = sortConfig.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortConfig.key = key;
+                sortConfig.direction = 'asc';
+            }
+            renderList();
+        }
+
+        function renderList() {
+            const tbody = document.getElementById('expenseList');
+            const emptyState = document.getElementById('emptyState');
+            tbody.innerHTML = '';
+            
+            let filtered = [...window.expenses];
+
+            if (currentFilter !== 'all') {
+                filtered = filtered.filter(exp => {
+                    const diff = getMonthDiff(exp.date, currentFilter);
+                    return diff >= 0 && diff < exp.installmentsCount;
+                });
+            }
+
+            filtered.sort((a, b) => {
+                let valA, valB;
+                if (sortConfig.key === 'totalValue') {
+                    valA = a.installmentValue * a.installmentsCount;
+                    valB = b.installmentValue * b.installmentsCount;
+                } else if (sortConfig.key === 'installmentValue') {
+                    valA = a.installmentValue;
+                    valB = b.installmentValue;
+                } else if (sortConfig.key === 'date') {
+                    valA = new Date(a.date).getTime();
+                    valB = new Date(b.date).getTime();
+                } else {
+                    valA = String(a[sortConfig.key]).toLowerCase();
+                    valB = String(b[sortConfig.key]).toLowerCase();
+                }
+                if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
+                if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            if (filtered.length === 0) {
+                emptyState.classList.remove('hidden');
+            } else {
+                emptyState.classList.add('hidden');
+                filtered.forEach(exp => {
+                    const total = exp.installmentValue * exp.installmentsCount;
+                    let progText = `${exp.installmentsCount}x`;
+                    let badgeClass = "bg-slate-100 text-slate-600";
+                    if (currentFilter !== 'all') {
+                        const cur = getMonthDiff(exp.date, currentFilter) + 1;
+                        progText = `${cur} de ${exp.installmentsCount}`;
+                        badgeClass = "bg-indigo-100 text-indigo-700";
+                    }
+                    const tr = document.createElement('tr');
+                    tr.className = "hover:bg-slate-50 transition-colors";
+                    tr.innerHTML = `
+                        <td class="px-6 py-4 font-medium">${exp.name}</td>
+                        <td class="px-6 py-4 text-slate-500">${formatDate(exp.date)}</td>
+                        <td class="px-6 py-4 font-semibold">${formatBRL(exp.installmentValue)}</td>
+                        <td class="px-6 py-4"><span class="px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-tight ${badgeClass}">${progText}</span></td>
+                        <td class="px-6 py-4 font-bold text-slate-900">${formatBRL(total)}</td>
+                        <td class="px-6 py-4 text-right">
+                            <button onclick="window.deleteExpense('${exp.id}')" class="text-slate-300 hover:text-red-500 transition-colors"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+                lucide.createIcons();
+            }
+        }
+
+        window.deleteExpense = async (docId) => {
+            if (!user) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'compras', docId));
+                showToast("Compra excluída!");
+            } catch (e) {
+                showToast("Erro ao excluir", "error");
+            }
+        }
+
+        window.showToast = (msg, type = 'success') => {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `${type === 'success' ? 'bg-emerald-600' : 'bg-rose-600'} text-white px-5 py-3 rounded-xl shadow-lg flex items-center gap-3 transition-all transform translate-y-0 opacity-100 border border-white/10`;
+            toast.innerHTML = `<i data-lucide="${type === 'success' ? 'check-circle' : 'alert-circle'}" class="w-5 h-5"></i><span class="text-sm font-medium">${msg}</span>`;
+            container.appendChild(toast);
+            lucide.createIcons();
+            setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 500); }, 3000);
+        }
+
+        window.processImportedData = async (data) => {
+            if (!user) return;
+            let countImported = 0;
+            let countIgnored = 0;
+
+            for (const row of data) {
+                const name = row['Descrição'] || row['Nome da Compra'];
+                const dateRaw = row['Data de compra'] || row['Data'];
+                const valueRaw = row['Valor (em R$)'] || row['Valor'];
+                const installmentRaw = row['Parcela'];
+
+                if (name && dateRaw && valueRaw) {
+                    let dStr = "";
+                    if (dateRaw instanceof Date) {
+                        const y = dateRaw.getFullYear();
+                        const m = String(dateRaw.getMonth() + 1).padStart(2, '0');
+                        const d = String(dateRaw.getDate()).padStart(2, '0');
+                        dStr = `${y}-${m}-${d}`;
+                    } else {
+                        const parts = String(dateRaw).split('/');
+                        if (parts.length === 3) dStr = `${parts[2]}-${parts[1]}-${parts[0]}`;
+                    }
+
+                    let val = typeof valueRaw === 'string' ? parseFloat(valueRaw.replace(/[^\d,.-]/g, '').replace(',', '.')) : parseFloat(valueRaw);
+                    
+                    let totalInstallments = 1;
+                    if (installmentRaw) {
+                        const s = String(installmentRaw);
+                        if (s.includes('/')) {
+                            totalInstallments = parseInt(s.split('/')[1]) || 1;
+                        } else {
+                            totalInstallments = parseInt(s) || 1;
+                        }
+                    }
+
+                    if (dStr && !isNaN(val)) {
+                        const isDuplicate = window.expenses.some(existing => 
+                            existing.name.trim().toLowerCase() === name.trim().toLowerCase() && 
+                            existing.date === dStr && 
+                            Math.abs(existing.installmentValue - val) < 0.01
+                        );
+
+                        if (!isDuplicate) {
+                            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'compras'), {
+                                name: name,
+                                date: dStr,
+                                installmentValue: val,
+                                installmentsCount: totalInstallments,
+                                createdAt: new Date().toISOString()
+                            });
+                            countImported++;
+                        } else {
+                            countIgnored++;
+                        }
+                    }
+                }
+            }
+
+            if (countImported > 0) showToast(`${countImported} itens importados!`);
+            document.getElementById('excelUpload').value = '';
+        }
+
+        document.getElementById('expenseForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!user) return;
+            
+            const name = document.getElementById('expName').value;
+            const date = document.getElementById('expDate').value;
+            const val = parseFloat(document.getElementById('expValue').value);
+            const inst = parseInt(document.getElementById('expInstallments').value);
+
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'compras'), {
+                name: name,
+                date: date,
+                installmentValue: val,
+                installmentsCount: inst,
+                createdAt: new Date().toISOString()
+            });
+
+            e.target.reset();
+            showToast("Compra salva!");
+        });
+
+        document.getElementById('excelUpload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                const data = new Uint8Array(evt.target.result);
+                const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                const json = XLSX.utils.sheet_to_json(worksheet);
+                window.processImportedData(json);
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        document.getElementById('monthFilter').addEventListener('change', (e) => {
+            currentFilter = e.target.value;
+            renderList();
+        });
+
+        lucide.createIcons();
+    </script>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans min-h-screen pb-12">
+
+    <!-- Modal AI -->
+    <div id="aiModal" class="fixed inset-0 bg-black/50 hidden z-[100] flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl animate-in fade-in zoom-in duration-200">
+            <div class="flex items-center gap-3 mb-4 border-b pb-4">
+                <div class="bg-indigo-100 p-2 rounded-lg">
+                    <i data-lucide="sparkles" class="w-6 h-6 text-indigo-600"></i>
+                </div>
+                <h3 class="text-xl font-bold">Análise Financeira ✨</h3>
+                <button onclick="document.getElementById('aiModal').classList.add('hidden')" class="ml-auto text-slate-400 hover:text-slate-600">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <div id="aiResultText" class="text-slate-600 leading-relaxed whitespace-pre-wrap text-sm">
+                Carregando análise...
+            </div>
+            <button onclick="document.getElementById('aiModal').classList.add('hidden')" class="w-full mt-6 bg-indigo-600 text-white font-medium py-2 rounded-lg hover:bg-indigo-700 transition-colors">
+                Entendido
+            </button>
+        </div>
+    </div>
+
+    <header class="bg-indigo-600 text-white shadow-md">
+        <div class="max-w-6xl mx-auto px-4 py-6 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <i data-lucide="credit-card" class="w-8 h-8"></i>
+                <h1 class="text-2xl font-bold">Controle de Fatura Mensal</h1>
+            </div>
+            <button id="aiAnalysisBtn" onclick="window.analyzeWithAI()" class="bg-indigo-500/30 hover:bg-indigo-500/50 border border-white/20 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-all">
+                <i data-lucide="sparkles" class="w-4 h-4"></i>
+                Análise IA
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-4 mt-8 space-y-8">
+        
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Formulario -->
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-1">
+                <div class="flex items-center gap-2 mb-6">
+                    <i data-lucide="plus-circle" class="w-5 h-5 text-indigo-600"></i>
+                    <h2 class="text-lg font-semibold">Nova Compra</h2>
+                </div>
+                <form id="expenseForm" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 mb-1">Nome da Compra</label>
+                        <input type="text" id="expName" required placeholder="Ex: Celular Novo" class="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-600 mb-1">Data da Compra</label>
+                        <input type="date" id="expDate" required class="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-600 mb-1">Parcela</label>
+                            <input type="number" id="expValue" required min="0.01" step="0.01" class="w-full px-4 py-2 rounded-lg border border-slate-300 outline-none transition-all">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-600 mb-1">Qtd</label>
+                            <input type="number" id="expInstallments" required min="1" step="1" class="w-full px-4 py-2 rounded-lg border border-slate-300 outline-none transition-all">
+                        </div>
+                    </div>
+                    <button type="submit" class="w-full mt-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2">
+                        <i data-lucide="save" class="w-4 h-4"></i> Salvar
+                    </button>
+                    <label for="excelUpload" class="w-full cursor-pointer bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2 border border-slate-300">
+                        <i data-lucide="file-spreadsheet" class="w-5 h-5 text-emerald-600"></i> Importar Excel
+                        <input type="file" id="excelUpload" accept=".xlsx, .xls, .csv" class="hidden">
+                    </label>
+                </form>
+            </div>
+
+            <!-- Gráfico e Resumo -->
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-2 flex flex-col">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="trending-up" class="w-5 h-5 text-indigo-600"></i>
+                        <h2 class="text-lg font-semibold">Projeção</h2>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <div id="totalPendente" class="text-xs font-bold text-white bg-indigo-600 px-4 py-1.5 rounded-full">
+                            Saldo Devedor: R$ 0,00
+                        </div>
+                        <div id="totalGlobal" class="text-xs font-medium text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full">
+                            Carregando...
+                        </div>
+                    </div>
+                </div>
+                <div class="relative flex-1 w-full min-h-[250px]">
+                    <canvas id="timelineChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Lista -->
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+            <div class="p-6 border-b border-slate-100 flex items-center justify-between">
+                <h2 class="text-lg font-semibold flex items-center gap-2">
+                    <i data-lucide="list" class="w-5 h-5 text-indigo-600"></i> Lista
+                </h2>
+                <select id="monthFilter" class="bg-slate-50 border border-slate-300 text-sm rounded-lg p-2">
+                    <option value="all">Todos os meses</option>
+                </select>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr class="bg-slate-50 text-slate-500 text-[10px] uppercase border-b">
+                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('name')">Compra</th>
+                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('date')">Data Inicial</th>
+                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('installmentValue')">Parcela</th>
+                            <th class="px-6 py-4">Progresso</th>
+                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('totalValue')">Total</th>
+                            <th class="px-6 py-4 text-right">Ação</th>
+                        </tr>
+                    </thead>
+                    <tbody id="expenseList" class="divide-y text-sm"></tbody>
+                </table>
+                <div id="emptyState" class="hidden flex flex-col items-center justify-center py-12 text-slate-400">
+                    <i data-lucide="inbox" class="w-10 h-10 mb-2 opacity-50"></i>
+                    <p>Vazio</p>
+                </div>
+            </div>
+        </div>
+    </main>
+    <div id="toastContainer" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2"></div>
+</body>
+</html>
