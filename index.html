@@ -15,17 +15,15 @@
         import { getFirestore, collection, onSnapshot, addDoc, deleteDoc, doc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
-        // Configurações do Firebase injetadas pelo ambiente
         const firebaseConfig = JSON.parse(__firebase_config);
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'controle-fatura-app';
-        const apiKey = ""; // Chave da API Gemini (vazia conforme instruções)
+        const apiKey = ""; 
 
         let user = null;
 
-        // Autenticação inicial obrigatória
         const initAuth = async () => {
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
@@ -67,14 +65,16 @@
         };
 
         /**
-         * REGRA DE FECHAMENTO (DIA 13):
-         * Se o dia da compra for >= 13, a primeira parcela vai para o mês seguinte.
+         * Lógica de Parcelamento Ajustada:
+         * Se o dia da compra for >= 13, a primeira parcela (index 0) vai para o mês seguinte.
          */
         const getMonthKey = (startDateStr, monthsToAdd) => {
             const [y, m, d] = startDateStr.split('-');
             const day = parseInt(d);
             let date = new Date(parseInt(y), parseInt(m) - 1, 1);
             
+            // Regra do dia 13: se comprou dia 13 ou depois, a fatura deste mês já fechou.
+            // Somamos um mês extra antes de calcular a parcela.
             const extraOffset = day >= 13 ? 1 : 0;
             
             date.setMonth(date.getMonth() + monthsToAdd + extraOffset);
@@ -91,11 +91,11 @@
             const targetYear = parseInt(y2);
             const targetMonth = parseInt(m2);
 
+            // Ajuste do fechamento da fatura para o cálculo de diferença
             const baseDiff = (targetYear - startYear) * 12 + (targetMonth - startMonth);
             return day >= 13 ? baseDiff - 1 : baseDiff;
         };
 
-        // --- ANALISE IA ---
         window.analyzeWithAI = async () => {
             if (window.expenses.length === 0) {
                 showToast("Adicione compras antes de analisar!", "error");
@@ -171,7 +171,6 @@
                     if (!monthlyTotals[monthKey]) monthlyTotals[monthKey] = 0;
                     monthlyTotals[monthKey] += exp.installmentValue;
 
-                    // Cálculo do Saldo Pendente (Contando do mês atual em diante)
                     if (monthKey >= currentMonthKey) {
                         pendingTotal += exp.installmentValue;
                     }
@@ -328,7 +327,7 @@
             let countIgnored = 0;
 
             for (const row of data) {
-                const name = row['Descrição'] || row['Nome da Compra'];
+                const name = row['Descrição'] || row['Nome da Compra'] || row['Descrição'];
                 const dateRaw = row['Data de compra'] || row['Data'];
                 const valueRaw = row['Valor (em R$)'] || row['Valor'];
                 const installmentRaw = row['Parcela'];
@@ -380,7 +379,11 @@
                 }
             }
 
-            if (countImported > 0) showToast(`${countImported} itens importados!`);
+            if (countImported > 0) {
+                showToast(`${countImported} novos itens importados!`);
+            } else if (countIgnored > 0) {
+                showToast(`${countIgnored} duplicados ignorados.`, 'error');
+            }
             document.getElementById('excelUpload').value = '';
         }
 
@@ -392,6 +395,17 @@
             const date = document.getElementById('expDate').value;
             const val = parseFloat(document.getElementById('expValue').value);
             const inst = parseInt(document.getElementById('expInstallments').value);
+
+            const isDuplicate = window.expenses.some(existing => 
+                existing.name.trim().toLowerCase() === name.trim().toLowerCase() && 
+                existing.date === date && 
+                Math.abs(existing.installmentValue - val) < 0.01
+            );
+
+            if (isDuplicate) {
+                showToast('Esta compra já existe!', 'error');
+                return;
+            }
 
             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'compras'), {
                 name: name,
@@ -441,7 +455,7 @@
                     <i data-lucide="x" class="w-5 h-5"></i>
                 </button>
             </div>
-            <div id="aiResultText" class="text-slate-600 leading-relaxed whitespace-pre-wrap text-sm">
+            <div id="aiResultText" class="text-slate-600 leading-relaxed whitespace-pre-wrap">
                 Carregando análise...
             </div>
             <button onclick="document.getElementById('aiModal').classList.add('hidden')" class="w-full mt-6 bg-indigo-600 text-white font-medium py-2 rounded-lg hover:bg-indigo-700 transition-colors">
@@ -458,7 +472,7 @@
             </div>
             <button id="aiAnalysisBtn" onclick="window.analyzeWithAI()" class="bg-indigo-500/30 hover:bg-indigo-500/50 border border-white/20 px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 transition-all">
                 <i data-lucide="sparkles" class="w-4 h-4"></i>
-                Análise IA
+                Análise com IA ✨
             </button>
         </div>
     </header>
@@ -466,12 +480,12 @@
     <main class="max-w-6xl mx-auto px-4 mt-8 space-y-8">
         
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Formulario -->
             <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-1">
                 <div class="flex items-center gap-2 mb-6">
                     <i data-lucide="plus-circle" class="w-5 h-5 text-indigo-600"></i>
                     <h2 class="text-lg font-semibold">Nova Compra</h2>
                 </div>
+                
                 <form id="expenseForm" class="space-y-4">
                     <div>
                         <label class="block text-sm font-medium text-slate-600 mb-1">Nome da Compra</label>
@@ -484,7 +498,10 @@
                     <div class="grid grid-cols-2 gap-4">
                         <div>
                             <label class="block text-sm font-medium text-slate-600 mb-1">Parcela</label>
-                            <input type="number" id="expValue" required min="0.01" step="0.01" class="w-full px-4 py-2 rounded-lg border border-slate-300 outline-none transition-all">
+                            <div class="relative">
+                                <span class="absolute left-3 top-2.5 text-slate-400">R$</span>
+                                <input type="number" id="expValue" required min="0.01" step="0.01" class="w-full pl-9 pr-4 py-2 rounded-lg border border-slate-300 outline-none transition-all">
+                            </div>
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-slate-600 mb-1">Qtd</label>
@@ -492,27 +509,31 @@
                         </div>
                     </div>
                     <button type="submit" class="w-full mt-4 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2">
-                        <i data-lucide="save" class="w-4 h-4"></i> Salvar
+                        <i data-lucide="save" class="w-4 h-4"></i> Salvar na Nuvem
                     </button>
-                    <label for="excelUpload" class="w-full cursor-pointer bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2 border border-slate-300">
+                    <div class="relative flex py-3 items-center">
+                        <div class="flex-grow border-t border-slate-200"></div>
+                        <span class="flex-shrink-0 mx-4 text-slate-400 text-sm">ou</span>
+                        <div class="flex-grow border-t border-slate-200"></div>
+                    </div>
+                    <label for="excelUpload" class="w-full cursor-pointer bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2 border border-slate-300 shadow-sm">
                         <i data-lucide="file-spreadsheet" class="w-5 h-5 text-emerald-600"></i> Importar Excel
                         <input type="file" id="excelUpload" accept=".xlsx, .xls, .csv" class="hidden">
                     </label>
                 </form>
             </div>
 
-            <!-- Gráfico e Resumo -->
             <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-2 flex flex-col">
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                     <div class="flex items-center gap-2">
                         <i data-lucide="trending-up" class="w-5 h-5 text-indigo-600"></i>
-                        <h2 class="text-lg font-semibold">Projeção</h2>
+                        <h2 class="text-lg font-semibold">Projeção de Gastos</h2>
                     </div>
                     <div class="flex flex-wrap gap-2">
-                        <div id="totalPendente" class="text-xs font-bold text-white bg-indigo-600 px-4 py-1.5 rounded-full">
+                        <div id="totalPendente" class="text-sm font-bold text-white bg-indigo-600 px-4 py-1.5 rounded-full shadow-sm">
                             Saldo Devedor: R$ 0,00
                         </div>
-                        <div id="totalGlobal" class="text-xs font-medium text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full">
+                        <div id="totalGlobal" class="text-sm font-medium text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full">
                             Carregando...
                         </div>
                     </div>
@@ -523,33 +544,36 @@
             </div>
         </div>
 
-        <!-- Lista -->
         <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-            <div class="p-6 border-b border-slate-100 flex items-center justify-between">
-                <h2 class="text-lg font-semibold flex items-center gap-2">
-                    <i data-lucide="list" class="w-5 h-5 text-indigo-600"></i> Lista
-                </h2>
-                <select id="monthFilter" class="bg-slate-50 border border-slate-300 text-sm rounded-lg p-2">
-                    <option value="all">Todos os meses</option>
-                </select>
+            <div class="p-6 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="list" class="w-5 h-5 text-indigo-600"></i>
+                    <h2 class="text-lg font-semibold">Lista de Compras</h2>
+                </div>
+                <div class="flex items-center gap-2">
+                    <label for="monthFilter" class="text-sm text-slate-600 font-medium">Filtrar mês:</label>
+                    <select id="monthFilter" class="bg-slate-50 border border-slate-300 text-slate-700 text-sm rounded-lg p-2 outline-none">
+                        <option value="all">Todos os meses</option>
+                    </select>
+                </div>
             </div>
             <div class="overflow-x-auto">
-                <table class="w-full text-left">
+                <table class="w-full text-left border-collapse">
                     <thead>
-                        <tr class="bg-slate-50 text-slate-500 text-[10px] uppercase border-b">
-                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('name')">Compra</th>
-                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('date')">Data Inicial</th>
-                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('installmentValue')">Parcela</th>
-                            <th class="px-6 py-4">Progresso</th>
-                            <th class="px-6 py-4 cursor-pointer" onclick="setSort('totalValue')">Total</th>
-                            <th class="px-6 py-4 text-right">Ação</th>
+                        <tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200">
+                            <th class="px-6 py-4 font-semibold cursor-pointer hover:text-indigo-600" onclick="setSort('name')">Compra</th>
+                            <th class="px-6 py-4 font-semibold cursor-pointer hover:text-indigo-600" onclick="setSort('date')">Data Inicial</th>
+                            <th class="px-6 py-4 font-semibold cursor-pointer hover:text-indigo-600" onclick="setSort('installmentValue')">Parcela (R$)</th>
+                            <th class="px-6 py-4 font-semibold">Progresso</th>
+                            <th class="px-6 py-4 font-semibold cursor-pointer hover:text-indigo-600" onclick="setSort('totalValue')">Total</th>
+                            <th class="px-6 py-4 font-semibold text-right">Ação</th>
                         </tr>
                     </thead>
-                    <tbody id="expenseList" class="divide-y text-sm"></tbody>
+                    <tbody id="expenseList" class="divide-y divide-slate-100"></tbody>
                 </table>
-                <div id="emptyState" class="hidden flex flex-col items-center justify-center py-12 text-slate-400">
-                    <i data-lucide="inbox" class="w-10 h-10 mb-2 opacity-50"></i>
-                    <p>Vazio</p>
+                <div id="emptyState" class="hidden flex-col items-center justify-center py-12 text-slate-400">
+                    <i data-lucide="inbox" class="w-12 h-12 mb-3 opacity-50"></i>
+                    <p>Nenhuma compra encontrada.</p>
                 </div>
             </div>
         </div>
